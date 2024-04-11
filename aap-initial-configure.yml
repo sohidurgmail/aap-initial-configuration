@@ -1,0 +1,743 @@
+---
+# Make sure collection tarball files are in the same folder:
+# - ansible.controller
+# - infra.ah_configuration
+# Run this playbook after AAP deployment to perform initial configuration.
+# Specify github parameters for repository that describes AAP configuration objects for current environment
+# ansible-playbook configure-aap.yml -i inventory -e "github_username=... github_cred=... github_repo=... playbook_name=<configure_aap.yml>"
+
+- name: Perform initial AAP configuration
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    github_repo: "https://github.com/sohidurgmail/aap-initial-configuration"
+    playbook_name: playbook/test.yml
+    collection_names:
+      - "ansible-controller-4.5.1.tar.gz"
+      - "infra-ah_configuration-2.0.4.tar.gz"
+    
+  tasks:
+    - name: Extract controller_nodes from the inventory
+      ansible.builtin.set_fact:
+        controller_node: "{{ groups['automationcontroller'] | first }}"
+
+# Import collections to Hub - ansible.controller and infra.ah_configuration from RH Certified
+# Get token for that user
+# Setting the environment, creating Controller Automation user with random password and storing the user token
+
+    - name: Generate Controller token
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/tokens/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ ('admin:' + admin_password) | b64encode }}"
+        body:
+          description: "Personal Controller token"
+        validate_certs: false
+      register: controller_token
+      failed_when: "controller_token.status not in [200, 201]"
+
+    - name: Generate Random Password for Controller Automation user
+      ansible.builtin.command: python3 -c "import secrets; print(secrets.token_urlsafe(16))"
+      register: automation_user_random_password
+
+    - name: Get all the users from AAP
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/users/"
+        method: GET
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: cont_user_result
+
+    - name: Check if Controller Automation User exists
+      ansible.builtin.set_fact:
+        cont_user_id: >-
+          {{ 
+            cont_user_result.json.results | 
+            selectattr('username', 'equalto', 'aap-admin') | 
+            map(attribute='id') | 
+            first | 
+            default('')
+          }}
+
+    - name: Create automation user with random password
+      when: cont_user_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/users/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          username: "aap-admin"
+          first_name: "Controller"
+          last_name: "Admin"
+          password: "{{ automation_user_random_password.stdout }}"
+          is_superuser: true
+        validate_certs: false
+      register: automation_user
+      failed_when: "controller_token.status not in [200, 201]"
+
+    - name: Get token for the created user
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/tokens/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          description: "Token for AAP Config User"
+        validate_certs: false
+      register: user_token
+      failed_when: "user_token.status not in [200, 201]"
+
+# Configuring Private Automation Hub, Creating new namespaces, user and exporting necessary collections to the PAH 
+
+    - name: Set Automation Hub URL
+      set_fact:
+        automation_hub: "{{ groups['automationhub'] | first }}"
+
+    - name: Get existing namespaces
+      ansible.builtin.uri:
+        url: https://{{ automation_hub }}/api/galaxy/_ui/v1/my-namespaces/?fields=name&limit=150
+        user: "admin"
+        password: "{{ automationhub_admin_password }}"
+        method: GET
+        force_basic_auth: true
+        validate_certs: false
+      register: existing_namespaces
+
+    - name: Set existing namespace IDs
+      ansible.builtin.set_fact:
+        existing_namespace_ids: >-
+          {{
+            existing_namespaces.json.data |
+            map(attribute='name') |
+            list
+          }}
+
+    - name: Define namespaces which will be added to the Private Automation Hub
+      ansible.builtin.set_fact:
+        namespaces_to_match:
+          - infra
+          - ansible
+
+    - name: Initialize matched_namespaces list
+      ansible.builtin.set_fact:
+        matched_namespaces: []
+
+    - name: Iterate through existing namespaces
+      ansible.builtin.set_fact:
+        matched_namespaces: >-
+          {{
+            matched_namespaces +
+            [item] |
+            unique
+          }}
+      loop: "{{ existing_namespaces.json.data | map(attribute='name') }}"
+      when: item in namespaces_to_match
+
+    - name: Create namespaces for collections
+      ansible.builtin.uri:
+        url: https://{{ automation_hub }}/api/galaxy/_ui/v1/namespaces/
+        user: "admin"
+        password: "{{ automationhub_admin_password }}"
+        method: POST
+        body: '{
+                 "name": "{{ item }}",
+                 "groups": []
+               }'
+        force_basic_auth: true
+        status_code: 201
+        body_format: json
+        validate_certs: false
+      loop: "{{ namespaces_to_match | difference(matched_namespaces) }}"
+
+    - name: Create ansible.cfg file
+      ansible.builtin.copy:
+        content: |
+          [galaxy]
+          server_list = my_org_hub
+          [galaxy_server.my_org_hub]
+          url=https://{{ automation_hub }}/api/galaxy/
+          username=admin
+          password={{ automationhub_admin_password }}
+        dest: '{{ playbook_dir }}/ansible.cfg'
+      delegate_to: localhost
+
+    - name: Upload ansible.controller collection to Private Automation Hub
+      ansible.builtin.command:
+        cmd: "ANSIBLE_CONFIG='{{ playbook_dir }}/ansible.cfg' ansible-galaxy collection publish {{ playbook_dir }}/{{ item }} -c"
+      delegate_to: localhost
+      loop: "{{ collection_names }}"
+      ignore_errors: true
+      failed_when: false
+
+# Approve uploaded collections to the PAH
+
+    - name: Please login in to PAH and approve all the uploaded collections
+      ansible.builtin.pause:
+        seconds: 180  # Adjust the pause duration as needed
+    
+    - name: Generate Random Password for Private Automation Hub Token creator user
+      ansible.builtin.command: python3 -c "import secrets; print(secrets.token_urlsafe(16))"
+      register: private_hub_user_random_password
+
+    - name: Get Private Automation Hub use list
+      ansible.builtin.uri:
+        url: https://{{ automation_hub }}/api/galaxy/pulp/api/v3/users/
+        user: "admin"
+        password: "{{ automationhub_admin_password }}"
+        method: GET
+        force_basic_auth: true
+        validate_certs: false
+      register: check_user_result
+
+    - name: Check if PAH Token user exists
+      ansible.builtin.set_fact:
+        hub_user_id: >-
+          {{ 
+            check_user_result.json.results | 
+            selectattr('username', 'equalto', 'hub-token-creator') | 
+            map(attribute='id') | 
+            first | 
+            default('')
+          }}
+
+    - name: Create Automation Hub User
+      when: hub_user_id == ''
+      ansible.builtin.uri:
+        url: https://{{ automation_hub }}/api/galaxy/_ui/v1/users/
+        user: "admin"
+        password: "{{ automationhub_admin_password }}"
+        method: POST
+        body: '{"username": "hub-token-creator", "password": "{{ private_hub_user_random_password.stdout }}", "is_superuser": false}'
+        force_basic_auth: true
+        body_format: json
+        validate_certs: false
+      register: hub_user
+      failed_when: "hub_user.status not in [200, 201]"
+
+    - name: Delete ansible.cfg file
+      ansible.builtin.file:
+        path: '{{ playbook_dir }}/ansible.cfg'
+        state: absent
+      delegate_to: localhost
+
+# Creating inventory and adding localhost to host to that inventory
+
+    - name: Get all the existing inventory list from AAP
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/inventories/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_inventories
+      ignore_errors: true
+
+    - name: Check if AAP Config Inventory exists
+      ansible.builtin.set_fact:
+        inventory_id: >-
+          {{ 
+            existing_inventories.json.results | 
+            selectattr('name', 'equalto', 'AAP Config Inventory') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              inventory.json.id is defined | ternary(inventory.json.id, '')
+            )
+          }}
+ 
+    - name: Create AAP Config Inventory if not exists
+      when: inventory_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/inventories/"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body_format: json
+        body:
+          name: "AAP Config Inventory"
+          description: "Initial Inventory with Control nodes to configure AAP"
+          organization: 1
+          kind: ""
+          host_filter: null
+          variables: ""
+          prevent_instance_group_fallback: false
+        validate_certs: false
+      register: inventory
+      failed_when: "inventory.status not in [200, 201]"
+
+    - name: Set inventory_id after creating inventory
+      ansible.builtin.set_fact:
+        inventory_id: "{{ inventory.json.id | default(inventory_id) }}"
+
+    - name: Get all the host information from the AAP config inventory
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/inventories/{{ inventory_id }}/hosts/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_inventory_host
+      ignore_errors: true
+
+    - name: Check if localhost exists in the AAP config inventory
+      ansible.builtin.set_fact:
+        inventory_host_id: >-
+          {{ 
+            existing_inventory_host.json.results | 
+            selectattr('name', 'equalto', 'localhost') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              inventory_host.json.id is defined | ternary(inventory_host.json.id, '')
+            )
+          }}
+
+    - name: Add localhost as a host to the AAP config inventory
+      when: inventory_host_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/inventories/{{ inventory_id }}/hosts/"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body_format: json
+        body:
+          name: "localhost"
+          description: ""
+          enabled: true
+          variables: ""
+        validate_certs: false
+      register: inventory_host
+      failed_when: "inventory_host.status not in [200, 201]"
+
+# Creating credentials for AAP configuration, github access and PAH access on the AAP controller
+
+    - name: Retrive all the existing credentials
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/credentials/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_controller_credential
+
+    - name: Check if AAP Controller automation Credential exists
+      ansible.builtin.set_fact:
+        controller_credential_id: >-
+          {{ 
+            existing_controller_credential.json.results | 
+            selectattr('name', 'equalto', 'AAP Controller automation Credential') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              controller_credential.json.id is defined | ternary(controller_credential.json.id, '')
+            )
+          }}
+
+    - name: Get all the existing credential types from the AAP
+      uri:
+        url: "https://{{ controller_node }}/api/v2/credential_types/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_credential_types
+
+    - name: Check if the Red Hat Ansible Automation Platform credential type exists
+      set_fact:
+        credential_type_id: >-
+          {{ 
+            existing_credential_types.json.results | 
+            selectattr('name', 'equalto', 'Red Hat Ansible Automation Platform') | 
+            map(attribute='id') | 
+            first | 
+            default('')
+          }}
+
+    - name: Create AAP Controller automation credential
+      when: controller_credential_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/credentials/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: "AAP Controller automation Credential"
+          description: "Red Hat Ansible Automation Platform type AAP config credential"
+          credential_type: "{{ credential_type_id }}"
+          host: "{{ controller_node }}"
+          user: 1
+          inputs:
+            host: "{{ controller_node }}"
+            oauth_token: "{{ user_token.json.token }}"
+        validate_certs: false
+      register: controller_credential
+      failed_when: "controller_credential.status not in [200, 201]"
+
+    - name: Set controller_credential_id after creating controller_credential
+      ansible.builtin.set_fact:
+        controller_credential_id: "{{ controller_credential.json.id | default(controller_credential_id) }}"
+
+# Create custom credential type for Hub credential
+
+# Create Hub credential of custom type using Hub automation url (from inventory file), user and password for automation user created earlier
+
+    - name: Check if AAP Hub Automation credential exists
+      ansible.builtin.set_fact:
+        pah_credential_id: >-
+          {{
+            existing_controller_credential.json.results |
+            selectattr('name', 'equalto', 'AAP Hub Automation credential') |
+            map(attribute='id') |
+            first |
+            default(
+              pah_credential.json.id is defined | ternary(pah_credential.json.id, '')
+            )
+          }}
+ 
+    - name: Check if Red Hat Private Automation Hub credential type exists
+      set_fact:
+        pah_credential_type_id: >-
+          {{
+            existing_credential_types.json.results |
+            selectattr('name', 'equalto', 'Red Hat Private Automation Hub') |
+            map(attribute='id') |
+            first |
+            default('')
+          }}
+
+    - name: Create Red Hat Private Automation Hub credential type
+      when: pah_credential_type_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/credential_types/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: "Red Hat Private Automation Hub"
+          description: ""
+          kind: cloud
+          inputs:
+           {
+                "fields": [
+                    {
+                        "id": "PHUB_HOST",
+                        "type": "string",
+                        "label": "Hub host"
+                    },
+                    {
+                        "id": "PHUB_USERNAME",
+                        "type": "string",
+                        "label": "Hub username"
+                    },
+                    {
+                        "id": "PHUB_PASSWORD",
+                        "type": "string",
+                        "label": "Hub password",
+                        "secret": true
+                    },
+                    {
+                        "id": "PHUB_VERIFY_SSL",
+                        "type": "boolean",
+                        "label": "Verify SSL"
+                    }
+                ],
+                "required": [
+                    "PHUB_HOST",
+                    "PHUB_USERNAME",
+                    "PHUB_PASSWORD",
+                    "PHUB_VERIFY_SSL"
+                ]
+            }
+        validate_certs: false
+      register: pah_credential_type
+      failed_when: "pah_credential_type.status not in [200, 201]"
+ 
+    - name: Set pah_credential_type_id after creating credential type
+      ansible.builtin.set_fact:
+        pah_credential_type_id: "{{ pah_credential_type.json.id | default(pah_credential_type_id) }}"
+
+    - name: Create Private Automation Hub credential
+      when: pah_credential_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/credentials/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: "AAP Hub Automation credential"
+          description: "Custom AAP Hub Automation credential"
+          credential_type: "{{ pah_credential_type_id }}"
+          organization: 1
+          inputs:
+            PHUB_HOST: "{{ automation_hub }}"
+            PHUB_PASSWORD: "{{ private_hub_user_random_password.stdout }}"
+            PHUB_USERNAME: "hub-token-creator"
+            PHUB_VERIFY_SSL: false
+        validate_certs: false
+      register: pah_credential
+      failed_when: "pah_credential.status not in [200, 201]"
+
+    - name: Set pah_credential_id after creating controller_credential
+      ansible.builtin.set_fact:
+        pah_credential_id: "{{ pah_credential.json.id | default(pah_credential_id) }}"
+        
+    - name: Set github_credential_id
+      ansible.builtin.set_fact:
+        github_credential_id: >-
+          {{ 
+            existing_controller_credential.json.results | 
+            selectattr('name', 'equalto', 'GitHub Credential') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              github_credential.json.id is defined | ternary(github_credential.json.id, '')
+            )
+          }}
+          
+    - name: Create GitHub credential
+      when: github_credential_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/credentials/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: "GitHub Credential"
+          credential_type: 2
+          user: 1
+          inputs:
+              username: "{{ github_username }}"
+              password: "{{ github_cred }}"
+        validate_certs: false
+      register: github_credential
+      failed_when: "github_credential.status not in [200, 201]"
+
+    - name: Set github_credential_id after creating github_credential
+      ansible.builtin.set_fact:
+        github_credential_id: "{{ github_credential.json.id | default(github_credential_id) }}"
+
+# Creating project, template and running the template
+
+    - name: Check if AAP configure project exists
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/projects/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_project
+
+    - name: Set project_id
+      ansible.builtin.set_fact:
+        project_id: >-
+          {{ 
+            existing_project.json.results | 
+            selectattr('name', 'equalto', 'aap-config') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              project.json.id is defined | ternary(project.json.id, '')
+            )
+          }}
+
+    - name: Create project
+      when: project_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/projects/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: aap-config
+          scm_type: "git"
+          scm_url: "{{ github_repo }}"
+          organization: 1
+          credential: "{{ github_credential_id }}"
+          scm_update_on_launch: true
+        validate_certs: false
+      register: project
+      failed_when: "project.status not in [200, 201]"
+
+    - name: Set project_id after creating project
+      ansible.builtin.set_fact:
+        project_id: "{{ project.json.id | default(project_id) }}"
+
+    - name: Check if AAP template exists
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_job_template
+
+    - name: Set job_template_id
+      ansible.builtin.set_fact:
+        job_template_id: >-
+          {{ 
+            existing_job_template.json.results | 
+            selectattr('name', 'equalto', 'aap-config-template') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              job_template.json.id is defined | ternary(job_template.json.id, '')
+            )
+          }}
+
+    - name: Wait for project to synchronize
+      ansible.builtin.pause:
+        seconds: 180  # Adjust the pause duration as needed
+
+    - name: Create job template
+      when: job_template_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: aap-config-template
+          inventory: "{{ inventory_id }}"
+          project: "{{ project_id }}"
+          playbook: "{{ playbook_name }}"
+        validate_certs: false
+      register: job_template
+      failed_when: "job_template.status not in [200, 201]"
+
+    - name: Set job_template_id after creating job template
+      ansible.builtin.set_fact:
+        job_template_id: "{{ job_template.json.id | default(job_template_id) }}"
+
+    - name: get all the attached credentials attached to the Temlate
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/{{ job_template_id }}/credentials/"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        validate_certs: false
+      register: existing_attached_cred_to_template
+
+    - name: Set cont_cred_template_id
+      ansible.builtin.set_fact:
+        cont_cred_template_id: >-
+          {{ 
+            existing_attached_cred_to_template.json.results | 
+            selectattr('name', 'equalto', 'aap-control-cred') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              cont_cred_id.json.id is defined | ternary(cont_cred_id.json.id, '')
+            )
+          }}
+
+    - name: Set pah_cred_template_id
+      ansible.builtin.set_fact:
+        pah_cred_template_id: >-
+          {{ 
+            existing_attached_cred_to_template.json.results | 
+            selectattr('name', 'equalto', 'aap-pah-cred') | 
+            map(attribute='id') | 
+            first | 
+            default(
+              pah_cred_id.json.id is defined | ternary(pah_cred_id.json.id, '')
+            )
+          }}
+
+    - name: Add Red Hat Ansible Automation Platform type Credentials to the job template
+      when: cont_cred_template_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/{{ job_template_id }}/credentials/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: aap-control-cred
+          credential_type: "{{ credential_type_id }}"
+          credentials: "{{ controller_credential_id }}"
+        validate_certs: false
+      register: cont_cred_id
+      failed_when: "cont_cred_id.status not in [200, 201]"
+
+    - name: Add Red Hat Private Automation Hub type Credentials to the job template
+      when: pah_cred_template_id == ''
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/{{ job_template_id }}/credentials/"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body:
+          name: aap-pah-cred
+          credential_type: "{{ pah_credential_type_id }}"
+          credentials: "{{ pah_credential_id }}"
+        validate_certs: false
+      register: pah_cred_id
+      failed_when: "pah_cred_id.status not in [200, 201]"
+
+# Make sure to add credentials - controller and Hub
+# See if you can enable webhook
+
+    - name: Launch Job from Template
+      ansible.builtin.uri:
+        url: "https://{{ controller_node }}/api/v2/job_templates/{{ job_template_id }}/launch/"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ controller_token.json.token }}"
+        body_format: json
+        body:
+          name: "First job"
+          job_template: "{{ job_template_id }}"
+          job_type: "run"
+          inventory: "{{ inventory_id }}"
+        validate_certs: false
+      register: job_launch
+      failed_when: "job_launch.status not in [200, 201]"
+
+# Output random passwords for Hub and Controller automation users
+#
+    - name: Output random passwords for Controller automation user
+      ansible.builtin.debug:
+        msg: "AAP Automation Hub Password for user 'aap-admin': {{ automation_user_random_password.stdout }}"
+      when: automation_user_random_password.stdout is defined
+
+    - name: Output random passwords for Hub user
+      ansible.builtin.debug:
+        msg: "PAH Password for user 'hub-token-creator': {{ private_hub_user_random_password.stdout }}"
+      when: private_hub_user_random_password.stdout is defined

@@ -1,0 +1,8 @@
+- hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Test playbook
+      debug:
+        msg: "Hello, this playbook is running successfully!"
+
