@@ -42,14 +42,14 @@ hub-student1.h5dr9.example.opentlc.com
 [sso]
 
 [all:vars]
-admin_password='ekxfpwnf'
+admin_password='your-admin-pass'
 
 pg_host=''
 pg_port=5432
 
 pg_database='awx'
 pg_username='awx'
-pg_password=''
+pg_password='your-awx-pass'
 pg_sslmode='prefer'  # set to 'verify-full' for client-side enforced SSL
 
 # Execution Environment Configuration
@@ -78,7 +78,7 @@ receptor_listener_port=27199
 # Automation Hub Configuration
 #
 
-automationhub_admin_password='ekxfpwnf'
+automationhub_admin_password='your-automation-hub-pass'
 
 automationhub_pg_host=''
 automationhub_pg_port=5432
