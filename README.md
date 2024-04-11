@@ -1,11 +1,11 @@
 # aap-initial-configuration
-This Repo is to configure AAP after installation
 
+This Repo is to configure AAP after installation
 
 In the world of IT automation, Ansible has emerged as a powerful tool for streamlining tasks and orchestrating complex systems. With the release of Ansible Automation Platform (AAP) 2.X, managing automation workflows has become even more efficient. In this blog post, we'll explore how to configure a newly deployed AAP 2.X instance using API calls directly from a playbook. By following these steps, you'll be able to set up your automation environment swiftly and seamlessly.
 Of course, in most cases you will use a collection such as ansible.controller (Red Hat certified) or infra.controller_configuration (Red Hat validated) as a more flexible option to configure AAP. However for cases when collections are not available, such as initial configuration right after setup or environments with special security requirements where external collections are not approved for use, you will have no choice other than utilizing API calls.
 
-Prerequisites:
+### Prerequisites:
 Before diving into the configuration process, ensure you meet the following prerequisites:
 
 Ansible Automation Platform 2.X: Ensure that Ansible Automation Platform 2.X that is being configured was installed without errors and is accessible along with Private Automation Hub. AAP serves as an end-to-end automation platform to configure systems and orchestrate advanced workflows.
@@ -19,3 +19,7 @@ GitHub Repository: Prepare the GitHub repository URL where your Ansible playbook
 Collections Tarballs: If you are going to import any collections into Private Automation Hub, make sure collection tarball files are accessible by the playbook. Collections contain reusable automation content and modules necessary for various tasks within your automation workflows.
 
 Ansible Installation Inventory File: Ensure you have an inventory file containing the necessary configuration details, such as host addresses and groupings, for your Ansible installation. This can be the same inventory file you used for AAP installation and it is expected to be located in the same folder as the playbook containing the examples below.
+
+### To run the plabook:
+
+ansible-navigator run aap-initial-configure.yml -i inventory -e "github_username=<github_username> github_password=<github_pass>"
